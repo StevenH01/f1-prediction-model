@@ -65,7 +65,7 @@ def build_features(mode: str = "prequal") -> Path:
         df["drv_last5_points"] = df["points"].shift(1).rolling(5, min_periods=1).sum().fillna(0.0)
         return df
 
-    res = res.groupby("driverId", group_keys=False).apply(add_driver_rolling)
+    res = res.groupby("driverId", group_keys=False, include_groups=False).apply(add_driver_rolling)
 
     # Constructor rolling
     def add_cons_rolling(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,7 +75,7 @@ def build_features(mode: str = "prequal") -> Path:
         df["cons_last5_points"] = df["points"].shift(1).rolling(5, min_periods=1).sum().fillna(0.0)
         return df
 
-    res = res.groupby("constructorId", group_keys=False).apply(add_cons_rolling)
+    res = res.groupby("constructorId", group_keys=False, include_groups=False).apply(add_cons_rolling)
 
     # Track affinity (driver & constructor at this circuit)
     res = res.sort_values(["year","round"])

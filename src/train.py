@@ -81,7 +81,7 @@ def train_and_evaluate(mode: str = "prequal"):
         )
 
         # Calibrate on a slice of training set for stability
-        calibrator = CalibratedClassifierCV(base_estimator=clf, method="isotonic", cv=3)
+        calibrator = CalibratedClassifierCV(estimator=clf, method="isotonic", cv=3)
         calibrator.fit(X_tr, y_tr)
 
         proba = calibrator.predict_proba(X_te)[:,1]

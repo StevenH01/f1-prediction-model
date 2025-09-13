@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+data_raw/
+data_interim/
+models/
+reports/figures/
