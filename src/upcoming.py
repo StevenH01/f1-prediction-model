@@ -146,26 +146,118 @@ def _attach_team_name(out: pd.DataFrame) -> pd.DataFrame:
         return out.merge(m, on="constructorId", how="left")
     except Exception:
         return out
+    
+def _event_name(event) -> str | None:
+    import fastf1
+    sched = fastf1.get_event_schedule(event.year)
+    row = sched.loc[sched["RoundNumber"] == event.round]
+    if row.empty:
+        return None
+    return row.iloc[0]["EventName"]
+
+def _session_results(year: int, event_name: str, session_codes: list[str]):
+    """Try sessions in order and return the first non-empty .results DataFrame."""
+    import fastf1
+    for sc in session_codes:
+        try:
+            s = fastf1.get_session(year, event_name, sc)
+            s.load(telemetry=False, laps=False, weather=False)
+            if s.results is not None and not s.results.empty:
+                return s.results, sc
+        except Exception:
+            pass
+    return None, None
+
+def _find_roster(event) -> tuple[pd.DataFrame, str]:
+    """Return a 20-driver roster DataFrame for the target event, plus the source session code used.
+    Columns: code, team_live, forename, surname
+    """
+    import fastf1
+    # 1) Try target event sessions (Q, Sprint, R, FP3, FP2, FP1)
+    name = _event_name(event)
+    res, used = (None, None)
+    if name:
+        res, used = _session_results(event.year, name, ["Q", "Sprint", "R", "FP3", "FP2", "FP1"])
+
+    # 2) If not available yet (e.g., before the weekend), fall back to the previous round's Race
+    if res is None:
+        try:
+            sched = fastf1.get_event_schedule(event.year)
+            prev = sched[(sched["RoundNumber"] < event.round)]
+            if not prev.empty:
+                prev = prev.sort_values("RoundNumber").iloc[-1]
+                res, used = _session_results(event.year, prev["EventName"], ["R", "Q", "Sprint"])
+        except Exception:
+            pass
+
+    if res is None or res.empty:
+        # As an ultimate fallback, return empty; caller will handle
+        return pd.DataFrame(columns=["code","team_live","forename","surname"]), "none"
+
+    # Extract robustly across FastF1 versions
+    code = res["Abbreviation"]
+    team_col = "TeamName" if "TeamName" in res.columns else ("Team" if "Team" in res.columns else None)
+    team = res[team_col] if team_col else pd.Series([None] * len(res))
+    # Names
+    if "FullName" in res.columns:
+        full = res["FullName"].astype(str)
+        forename = full.str.split().str[:-1].str.join(" ")
+        surname = full.str.split().str[-1]
+    elif "BroadcastName" in res.columns:
+        # BroadcastName often like "L HAM"; we’ll keep it simple and leave names blank if messy
+        forename = pd.Series([""] * len(res))
+        surname = pd.Series([""] * len(res))
+    else:
+        forename = pd.Series([""] * len(res))
+        surname = pd.Series([""] * len(res))
+
+    roster = pd.DataFrame({
+        "code": code.astype(str),
+        "team_live": team.astype(str),
+        "forename_live": forename.astype(str),
+        "surname_live": surname.astype(str),
+    }).drop_duplicates(subset=["code"])
+    return roster, used
 
 def build_upcoming_features(include_quali: bool = False, year: int | None = None, rnd: int | None = None) -> pd.DataFrame:
-    """Construct a per-driver feature table for the next (or specified) race.
+    """Construct per-driver features for the next (or specified) race, ensuring 20 drivers.
 
-    Strategy:
-    - take each driver's latest prequal feature row for the season (form, Elo, etc.)
-    - update metadata to the target (year, round, synthetic raceId)
-    - optionally merge FastF1 qualifying results (post-qual mode)
+    Steps:
+    - Build a 20-driver roster from FastF1 (Q/Sprint/R/FPx; or previous round if the weekend hasn't started).
+    - Left-join the roster onto the latest prequal features by driver code.
+    - Optionally merge qualifying positions (post-qual).
     """
+    # Determine target event
     if year is None or rnd is None:
         ek = _fastf1_next_event()
     else:
         ek = EventKey(year=int(year), round=int(rnd))
 
+    # Latest features per driver (last available season)
     last = _load_last_known_prequal_features(ek.year)
-    upcoming = last.copy()
+
+    # Build roster (20 drivers) and merge
+    roster, src = _find_roster(ek)
+    if roster.empty:
+        # If we truly can't get any roster, fall back to whatever 'last' has (may be <20)
+        upcoming = last.copy()
+    else:
+        upcoming = roster.merge(last, on="code", how="left", suffixes=("_live", ""))
+        # Prefer live names/team for display; keep historical as fallback
+        if "forename_live" in upcoming.columns:
+            upcoming["forename"] = upcoming["forename_live"].where(upcoming["forename_live"].str.strip() != "", upcoming.get("forename"))
+        if "surname_live" in upcoming.columns:
+            upcoming["surname"] = upcoming["surname_live"].where(upcoming["surname_live"].str.strip() != "", upcoming.get("surname"))
+        if "team_live" in upcoming.columns:
+            # Put live team into 'constructor' for display purposes
+            upcoming["constructor"] = upcoming["team_live"].where(upcoming["team_live"].str.strip() != "", upcoming.get("constructor"))
+
+    # Set target metadata
     upcoming["year"] = ek.year
     upcoming["round"] = ek.round
-    upcoming["raceId"] = ek.year * 100 + ek.round  # synthetic to avoid collisions
+    upcoming["raceId"] = ek.year * 100 + ek.round  # synthetic
 
+    # Qualifying/grid if requested
     if include_quali:
         upcoming = _augment_with_fastf1_quali(ek, upcoming)
     else:
