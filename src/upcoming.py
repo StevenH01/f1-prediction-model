@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import joblib
 
-from .config import DATA_INTERIM, MODELS_DIR
+from .config import DATA_INTERIM, MODELS_DIR, EXCLUDED_DRIVER_NAMES, EXCLUDED_DRIVER_CODES, DATA_RAW
 
 @dataclass
 class EventKey:
@@ -78,7 +78,7 @@ def _ensure_quali_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _augment_with_fastf1_quali(event: EventKey, upcoming: pd.DataFrame) -> pd.DataFrame:
-    """Merge FastF1 qualifying positions into upcoming features (best-effort).
+    """Merge FastF1 qualifying positions and LIVE team names into upcoming features.
     If quali isn't available yet, returns the input with NaN quali fields.
     """
     import fastf1
@@ -97,18 +97,55 @@ def _augment_with_fastf1_quali(event: EventKey, upcoming: pd.DataFrame) -> pd.Da
         res = sess_q.results
         if res is None or res.empty:
             return _ensure_quali_cols(upcoming)
+
+        # Qualifying positions
         q = res[["Abbreviation", "Position"]].rename(
             columns={"Abbreviation": "code", "Position": "quali_pos"}
         )
-        q["grid_pos"] = q["quali_pos"]  # approximation; final grid may include penalties
+        q["grid_pos"] = q["quali_pos"]  # best-effort; real grid may change with penalties
+
         out = upcoming.merge(q, on="code", how="left")
+
+        # LIVE team name from session results (column may be 'TeamName' or 'Team' depending on FastF1 version)
+        team_col = "TeamName" if "TeamName" in res.columns else ("Team" if "Team" in res.columns else None)
+        if team_col:
+            roster = res[["Abbreviation", team_col]].rename(columns={"Abbreviation": "code", team_col: "team_live"})
+            out = out.merge(roster, on="code", how="left")
+            # Prefer the live team name for display; keep historical constructor as fallback
+            if "constructor" in out.columns:
+                out["constructor"] = out["team_live"].combine_first(out["constructor"])
+            else:
+                out["constructor"] = out["team_live"]
+
+        # Teammate grid gap (uses whatever constructor grouping we now have)
         if "constructorId" in out.columns:
             out["teammate_grid_gap"] = out.groupby("constructorId")["grid_pos"].transform(lambda s: s - s.min())
         else:
-            out["teammate_grid_gap"] = np.nan
+            # If we only have names, group by constructor string
+            if "constructor" in out.columns:
+                out["teammate_grid_gap"] = out.groupby("constructor")["grid_pos"].transform(lambda s: s - s.min())
+            else:
+                out["teammate_grid_gap"] = np.nan
+
         return out
     except Exception:
         return _ensure_quali_cols(upcoming)
+
+def _apply_driver_filter(df: pd.DataFrame) -> pd.DataFrame:
+    full = (df.get("forename", "").astype(str).str.strip() + " " +
+            df.get("surname", "").astype(str).str.strip()).str.replace(r"\s+", " ", regex=True).str.lower()
+    code = df.get("code", "").astype(str).str.upper()
+    keep = ~(full.isin(EXCLUDED_DRIVER_NAMES) | code.isin(EXCLUDED_DRIVER_CODES))
+    return df[keep]
+
+def _attach_team_name(out: pd.DataFrame) -> pd.DataFrame:
+    if "constructor" in out.columns:
+        return out
+    try:
+        m = pd.read_csv(DATA_RAW / "constructors.csv", usecols=["constructorId","name"]).rename(columns={"name":"constructor"})
+        return out.merge(m, on="constructorId", how="left")
+    except Exception:
+        return out
 
 def build_upcoming_features(include_quali: bool = False, year: int | None = None, rnd: int | None = None) -> pd.DataFrame:
     """Construct a per-driver feature table for the next (or specified) race.
@@ -162,10 +199,14 @@ def predict_next(mode: str = "postqual", year: int | None = None, rnd: int | Non
     Xs = scaler.transform(X)
     proba = model.predict_proba(Xs)[:, 1]
 
-    out_cols = [c for c in ["raceId","year","round","driverId","constructorId","code","forename","surname"] if c in feats.columns]
+    out_cols = [c for c in ["raceId","year","round","driverId","constructorId","code","forename","surname","grid_pos"] if c in feats.columns]
     out = feats[out_cols].copy()
     out["win_proba"] = proba
-    out = out.sort_values("win_proba", ascending=False).reset_index(drop=True)
+    out = _apply_driver_filter(out).sort_values("win_proba", ascending=False).reset_index(drop=True)
+    out = _attach_team_name(out)
+
+    # percent for convenience in CLI/UI
+    out["win_pct"] = (out["win_proba"] * 100).round(1)
     return out
 
 if __name__ == "__main__":
