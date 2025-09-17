@@ -8,6 +8,7 @@ from rich import print as rprint
 from .config import DATA_INTERIM
 from .ingest import load_kaggle_tables
 from .ratings import compute_multiplayer_elo
+from .config import DATA_INTERIM as _DI
 
 def _flag_dnf(status_str: str) -> int:
     if pd.isna(status_str):
@@ -65,7 +66,8 @@ def build_features(mode: str = "prequal") -> Path:
         df["drv_last5_points"] = df["points"].shift(1).rolling(5, min_periods=1).sum().fillna(0.0)
         return df
 
-    res = res.groupby("driverId", group_keys=False, include_groups=False).apply(add_driver_rolling)
+    res = res.groupby("driverId", group_keys=False).apply(add_driver_rolling)
+    # res = res.groupby("driverId", group_keys=False, include_groups=False).apply(add_driver_rolling)
 
     # Constructor rolling
     def add_cons_rolling(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,7 +77,8 @@ def build_features(mode: str = "prequal") -> Path:
         df["cons_last5_points"] = df["points"].shift(1).rolling(5, min_periods=1).sum().fillna(0.0)
         return df
 
-    res = res.groupby("constructorId", group_keys=False, include_groups=False).apply(add_cons_rolling)
+    res = res.groupby("constructorId", group_keys=False).apply(add_cons_rolling)
+    # res = res.groupby("constructorId", group_keys=False, include_groups=False).apply(add_cons_rolling)
 
     # Track affinity (driver & constructor at this circuit)
     res = res.sort_values(["year","round"])
@@ -105,6 +108,17 @@ def build_features(mode: str = "prequal") -> Path:
 
         # Teammate grid gap
         res["teammate_grid_gap"] = res.groupby(["raceId","constructorId"])["grid_pos"].transform(lambda s: s - s.min())
+
+    ff1_path = _DI / "fastf1_extras.parquet"
+    if ff1_path.exists():
+        ff1 = pd.read_parquet(ff1_path)
+        # Join on (year, round, driver code)
+        if "code" in res.columns:
+            res = res.merge(ff1.rename(columns={"driver_code": "code"}),
+                            on=["year", "round", "code"], how="left")
+        else:
+            # Fallback: if 'code' is missing, at least merge by (year, round)
+            res = res.merge(ff1, on=["year", "round"], how="left")
 
     # Final feature set
     feature_cols = [
