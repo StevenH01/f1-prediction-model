@@ -5,4 +5,5 @@ data_raw/
 data_interim/
 models/
 reports/figures/
-data_cache
+data_cache/
+reports/
