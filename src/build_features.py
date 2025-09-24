@@ -112,12 +112,10 @@ def build_features(mode: str = "prequal") -> Path:
     ff1_path = _DI / "fastf1_extras.parquet"
     if ff1_path.exists():
         ff1 = pd.read_parquet(ff1_path)
-        # Join on (year, round, driver code)
         if "code" in res.columns:
             res = res.merge(ff1.rename(columns={"driver_code": "code"}),
                             on=["year", "round", "code"], how="left")
         else:
-            # Fallback: if 'code' is missing, at least merge by (year, round)
             res = res.merge(ff1, on=["year", "round"], how="left")
 
     # Final feature set
