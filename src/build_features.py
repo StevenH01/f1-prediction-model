@@ -1,154 +1,244 @@
+# src/build_features.py
 from __future__ import annotations
 import argparse
-from pathlib import Path
-import pandas as pd
 import numpy as np
-from rich import print as rprint
+import pandas as pd
 
-from .config import DATA_INTERIM
-from .ingest import load_kaggle_tables
-from .ratings import compute_multiplayer_elo
-from .config import DATA_INTERIM as _DI
+from .config import DATA_RAW, DATA_INTERIM
 
-def _flag_dnf(status_str: str) -> int:
-    if pd.isna(status_str):
-        return 0
-    s = str(status_str).lower()
-    # Consider anything not 'finished' or '+N laps' as DNF
-    if s.startswith("finished") or "lap" in s:
-        return 0
-    return 1
+# -----------------------------
+# Helpers
+# -----------------------------
 
-def build_features(mode: str = "prequal") -> Path:
-    assert mode in {"prequal", "postqual"}
-    tables = load_kaggle_tables()
+def _time_to_seconds(x):
+    """Convert 'M:SS.mmm' or 'SS.mmm' lap time strings to float seconds."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return np.nan
+    s = str(x).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return np.nan
+    try:
+        if ":" in s:
+            m, rest = s.split(":", 1)
+            return int(m) * 60.0 + float(rest)
+        return float(s)
+    except Exception:
+        return np.nan
 
-    races = tables["races"]
-    results = tables["results"]
-    drivers = tables["drivers"]
-    constructors = tables["constructors"]
-    qualifying = tables["qualifying"]
-    circuits = tables["circuits"]
-    status = tables["status"]
+def _ensure_dirs():
+    DATA_INTERIM.mkdir(parents=True, exist_ok=True)
 
-    # Merge result essentials
-    res = results.merge(races[["raceId","year","round","circuitId","name"]], on="raceId", how="left")
-    res = res.merge(drivers[["driverId","driverRef","code","forename","surname"]], on="driverId", how="left")
-    res = res.merge(constructors[["constructorId","name"]].rename(columns={"name":"constructor"}), on="constructorId", how="left")
-    res = res.merge(status, on="statusId", how="left")
+# -----------------------------
+# Load & merge raw tables
+# -----------------------------
 
-    # Basic filters & fields
-    # Use positionOrder (numeric order), drop rows without it
-    res = res[pd.notna(res["positionOrder"])].copy()
-    res["positionOrder"] = res["positionOrder"].astype(int)
-    res["is_win"] = (res["positionOrder"] == 1).astype(int)
-    res["dnf"] = res["status"].apply(_flag_dnf)
+def load_raw() -> dict[str, pd.DataFrame]:
+    r = {}
+    r["races"] = pd.read_csv(DATA_RAW / "races.csv")
+    r["results"] = pd.read_csv(DATA_RAW / "results.csv")
+    r["drivers"] = pd.read_csv(DATA_RAW / "drivers.csv")
+    r["constructors"] = pd.read_csv(DATA_RAW / "constructors.csv")
+    qpath = DATA_RAW / "qualifying.csv"
+    r["qualifying"] = pd.read_csv(qpath) if qpath.exists() else pd.DataFrame()
+    spath = DATA_RAW / "status.csv"
+    r["status"] = pd.read_csv(spath) if spath.exists() else pd.DataFrame()
+    return r
 
-    # Driver Elo pre-race
-    elo_driver = compute_multiplayer_elo(res[["raceId","year","round","driverId","positionOrder"]].copy(), by="driverId")
-    res = res.merge(elo_driver, on=["raceId","driverId"], how="left")
+def make_base(raw: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    races = raw["races"].copy()
+    res = raw["results"].copy()
+    drv = raw["drivers"].copy()
+    cons = raw["constructors"].copy()
 
-    # Constructor Elo pre-race
-    tmp = res[["raceId","year","round","constructorId","positionOrder"]].dropna().copy()
-    elo_cons = compute_multiplayer_elo(tmp.rename(columns={"constructorId":"entityId"}).assign(constructorId=lambda d: d["entityId"]).drop(columns=["entityId"]),
-                                       by="constructorId")
-    res = res.merge(elo_cons, on=["raceId","constructorId"], how="left")
+    races_small = races[["raceId","year","round","circuitId","name","date"]].copy()
 
-    # Rolling aggregates (driver season to date)
-    res = res.sort_values(["year","round","driverId"])
-    res["points"] = res["points"].fillna(0.0)
+    out = res.merge(races_small, on="raceId", how="left", validate="many_to_one")
 
-    def add_driver_rolling(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.sort_values(["year","round"])
-        df["drv_points_season_to_date"] = df.groupby("year")["points"].cumsum().shift(1).fillna(0.0)
-        df["drv_avg_finish_season"] = df.groupby("year")["positionOrder"].apply(lambda s: s.shift(1).expanding().mean()).values
-        df["drv_dnf_season"] = df.groupby("year")["dnf"].cumsum().shift(1).fillna(0.0)
-        df["drv_last5_points"] = df["points"].shift(1).rolling(5, min_periods=1).sum().fillna(0.0)
-        return df
+    # driver info
+    drv["forename"] = drv.get("forename", "").astype(str)
+    drv["surname"] = drv.get("surname", "").astype(str)
+    keep_drv = [c for c in ["driverId","driverRef","code","forename","surname","nationality"] if c in drv.columns]
+    out = out.merge(drv[keep_drv], on="driverId", how="left", validate="many_to_one")
 
-    res = res.groupby("driverId", group_keys=False).apply(add_driver_rolling)
-    # res = res.groupby("driverId", group_keys=False, include_groups=False).apply(add_driver_rolling)
+    # constructor info
+    cons = cons.rename(columns={"name":"constructor"})
+    keep_cons = [c for c in ["constructorId","constructor","nationality"] if c in cons.columns]
+    out = out.merge(cons[keep_cons], on="constructorId", how="left", validate="many_to_one")
 
-    # Constructor rolling
-    def add_cons_rolling(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.sort_values(["year","round"])
-        df["cons_points_season_to_date"] = df.groupby("year")["points"].cumsum().shift(1).fillna(0.0)
-        df["cons_dnf_season"] = df.groupby("year")["dnf"].cumsum().shift(1).fillna(0.0)
-        df["cons_last5_points"] = df["points"].shift(1).rolling(5, min_periods=1).sum().fillna(0.0)
-        return df
+    # grid position (treat <=0 as NaN)
+    if "grid" in out.columns:
+        out["grid_pos"] = pd.to_numeric(out["grid"], errors="coerce")
+        out.loc[out["grid_pos"] <= 0, "grid_pos"] = np.nan
 
-    res = res.groupby("constructorId", group_keys=False).apply(add_cons_rolling)
-    # res = res.groupby("constructorId", group_keys=False, include_groups=False).apply(add_cons_rolling)
-
-    # Track affinity (driver & constructor at this circuit)
-    res = res.sort_values(["year","round"])
-    res["drv_circuit_prev_med_finish"] = (
-        res.groupby(["driverId","circuitId"])["positionOrder"]
-          .apply(lambda s: s.shift(1).rolling(3, min_periods=1).median())
-          .reset_index(level=[0,1], drop=True)
-    )
-    res["cons_circuit_prev_med_finish"] = (
-        res.groupby(["constructorId","circuitId"])["positionOrder"]
-          .apply(lambda s: s.shift(1).rolling(3, min_periods=1).median())
-          .reset_index(level=[0,1], drop=True)
-    )
-
-    # Qualifying/grid (post-qual only)
-    if mode == "postqual":
-        # Get best quali position per driver in race
-        qbest = qualifying.sort_values(["raceId","driverId","position"]).drop_duplicates(["raceId","driverId"], keep="first")
-        qbest = qbest.rename(columns={"position":"quali_pos"})
-        res = res.merge(qbest[["raceId","driverId","quali_pos"]], on=["raceId","driverId"], how="left")
-
-        # Use results.grid as known pre-race grid (may include penalties)
-        if "grid" in res.columns:
-            res["grid_pos"] = res["grid"].replace(0, pd.NA)  # 0 sometimes means pit-lane start; treat as NA
+    # finish position (ranking label)
+    if "finish_pos" not in out.columns:
+        if "positionOrder" in out.columns:
+            out["finish_pos"] = pd.to_numeric(out["positionOrder"], errors="coerce")
+        elif "position" in out.columns:
+            out["finish_pos"] = pd.to_numeric(out["position"], errors="coerce")
         else:
-            res["grid_pos"] = pd.NA
+            out["finish_pos"] = np.nan
 
-        # Teammate grid gap
-        res["teammate_grid_gap"] = res.groupby(["raceId","constructorId"])["grid_pos"].transform(lambda s: s - s.min())
+    # binary win target
+    out["is_win"] = (out["finish_pos"] == 1).astype(int)
 
-    ff1_path = _DI / "fastf1_extras.parquet"
-    if ff1_path.exists():
-        ff1 = pd.read_parquet(ff1_path)
-        if "code" in res.columns:
-            res = res.merge(ff1.rename(columns={"driver_code": "code"}),
-                            on=["year", "round", "code"], how="left")
+    # status -> DNF
+    if "status" not in out.columns and "statusId" in out.columns and not raw["status"].empty:
+        status_map = raw["status"][ ["statusId","status"] ]
+        out = out.merge(status_map, on="statusId", how="left")
+    if "status" in out.columns:
+        s = out["status"].astype(str).str.lower()
+        finished = s.str.contains("finished") | s.str.contains("lap") | s.str.contains("laps")
+        out["dnf"] = (~finished).astype(int)
+    else:
+        out["dnf"] = np.nan
+
+    # qualifying merge
+    qual = raw["qualifying"]
+    if not qual.empty:
+        q = qual.copy()
+        if "position" in q.columns:
+            qpos = (q.groupby(["raceId","driverId"])['position'].min()
+                      .rename("quali_pos").reset_index())
         else:
-            res = res.merge(ff1, on=["year", "round"], how="left")
+            qpos = pd.DataFrame(columns=["raceId","driverId","quali_pos"])
+        for col in ["q1","q2","q3"]:
+            if col in q.columns:
+                q[col+"_s"] = q[col].apply(_time_to_seconds)
+        if any(col in q.columns for col in ["q1_s","q2_s","q3_s"]):
+            q_times = (q.assign(best_q_s = q[[c for c in ["q1_s","q2_s","q3_s"] if c in q.columns]].min(axis=1))
+                         .groupby(["raceId","driverId"])['best_q_s'].min().reset_index()
+                         .rename(columns={"best_q_s":"quali_best_s"}))
+        else:
+            q_times = pd.DataFrame(columns=["raceId","driverId","quali_best_s"])
+        out = (out.merge(qpos, on=["raceId","driverId"], how="left")
+                  .merge(q_times, on=["raceId","driverId"], how="left"))
 
-    # Final feature set
-    feature_cols = [
-        "driverId","constructorId","raceId","year","round",
-        "driverRef","code","forename","surname","constructor",
-        "driverId_elo_pre","constructorId_elo_pre",
-        "drv_points_season_to_date","drv_avg_finish_season","drv_dnf_season","drv_last5_points",
-        "cons_points_season_to_date","cons_dnf_season","cons_last5_points",
-        "drv_circuit_prev_med_finish","cons_circuit_prev_med_finish",
-    ]
+    if "code" in out.columns:
+        out["code"] = out["code"].astype(str).str.upper().replace({"nan":""})
 
-    if mode == "postqual":
-        feature_cols += ["quali_pos","grid_pos","teammate_grid_gap"]
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.sort_values(["year","round","raceId","driverId"]).reset_index(drop=True)
+    return out
 
-    # Some columns may not exist if no quali data present in early eras
-    feature_cols = [c for c in feature_cols if c in res.columns]
+# -----------------------------
+# Rolling features (leak-safe) — use transform to preserve index
+# -----------------------------
 
-    feats = res[feature_cols + ["is_win"]].copy()
+def _driver_rollings(df: pd.DataFrame) -> pd.DataFrame:
+    g = df.sort_values(["year","round"]).copy()
 
-    # Numeric cleaning
-    numeric_cols = [c for c in feats.columns if c not in {"driverRef","code","forename","surname","constructor"}]
-    feats[numeric_cols] = feats[numeric_cols].apply(pd.to_numeric, errors="coerce")
-    feats = feats.dropna(subset=["raceId","driverId","constructorId","year","round"])
+    # season-to-date driver points BEFORE the current race
+    if "points" in g.columns:
+        pts = pd.to_numeric(g["points"], errors="coerce").fillna(0.0)
+        # cumsum per (year, driver), then subtract current race's points
+        cum = pts.groupby([g["year"], g["driverId"]]).cumsum()
+        g["drv_points_season_to_date"] = (cum - pts).astype(float)
+    else:
+        g["drv_points_season_to_date"] = np.nan
 
-    # Save
+    # average finish last 5 (exclude current)
+    g["drv_avg_finish_last5"] = (
+        g.groupby("driverId")["finish_pos"]
+         .transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+    )
+
+    # podium rate last 5
+    pod = (g["finish_pos"] <= 3).astype(float)
+    g["drv_podium_rate_last5"] = (
+        pod.groupby(g["driverId"]).transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+    )
+
+    # dnf rate last 8
+    if "dnf" in g.columns:
+        g["drv_dnf_rate_last8"] = (
+            g.groupby("driverId")["dnf"].transform(lambda s: s.shift(1).rolling(8, min_periods=1).mean())
+        )
+    else:
+        g["drv_dnf_rate_last8"] = np.nan
+
+    return g
+
+def _constructor_rollings(df: pd.DataFrame) -> pd.DataFrame:
+    g = df.sort_values(["year","round"]).copy()
+
+    if "points" in g.columns:
+        ptsc = pd.to_numeric(g["points"], errors="coerce").fillna(0.0)
+        cumc = ptsc.groupby([g["year"], g["constructorId"]]).cumsum()
+        g["cons_points_season_to_date"] = (cumc - ptsc).astype(float)
+    else:
+        g["cons_points_season_to_date"] = np.nan
+
+    g["cons_avg_finish_last5"] = (
+        g.groupby("constructorId")["finish_pos"].transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
+    )
+
+    if "dnf" in g.columns:
+        g["cons_dnf_rate_last8"] = (
+            g.groupby("constructorId")["dnf"].transform(lambda s: s.shift(1).rolling(8, min_periods=1).mean())
+        )
+    else:
+        g["cons_dnf_rate_last8"] = np.nan
+
+    return g
+
+# -----------------------------
+# Optional FastF1 extras
+# -----------------------------
+
+def _merge_fastf1_extras(df: pd.DataFrame) -> pd.DataFrame:
+    path = DATA_INTERIM / "fastf1_extras.parquet"
+    if not path.exists():
+        return df
+    ff1 = pd.read_parquet(path)
+    if "driver_code" in ff1.columns:
+        ff1 = ff1.rename(columns={"driver_code":"code"})
+    keep = [c for c in ff1.columns if c in {"year","round","code","quali_best_s","bestlap_pct_fp1","bestlap_pct_fp2","bestlap_pct_fp3","quali_rank"}]
+    ff1 = ff1[keep].copy()
+    if all(c in df.columns for c in ["year","round","code"]):
+        df = df.merge(ff1, on=["year","round","code"], how="left")
+    return df
+
+# -----------------------------
+# Build features
+# -----------------------------
+
+def build_features(mode: str):
+    assert mode in {"prequal","postqual"}
+    _ensure_dirs()
+    raw = load_raw()
+    res = make_base(raw)
+
+    # Rolling features (transform-based to preserve index)
+    res = _driver_rollings(res)
+    res = _constructor_rollings(res)
+
+    # Optional: merge FastF1 extras
+    res = _merge_fastf1_extras(res)
+
+    # Leakage guard by mode
+    if mode == "prequal":
+        for c in ["quali_pos","quali_best_s","grid_pos"]:
+            if c in res.columns:
+                res[c] = np.nan
+
+    # Cast numerics
+    for c in ["quali_pos","quali_best_s","grid_pos","finish_pos",
+              "drv_points_season_to_date","drv_avg_finish_last5","drv_podium_rate_last5","drv_dnf_rate_last8",
+              "cons_points_season_to_date","cons_avg_finish_last5","cons_dnf_rate_last8"]:
+        if c in res.columns:
+            res[c] = pd.to_numeric(res[c], errors="coerce" )
+
     out_path = DATA_INTERIM / f"features_{mode}.parquet"
-    feats.to_parquet(out_path, index=False)
-    rprint(f"[green]Wrote features -->[/green] {out_path}")
-    return out_path
+    res.to_parquet(out_path, index=False)
+    print(f"Wrote {out_path} with {len(res)} rows and {res.shape[1]} columns.")
+
+# -----------------------------
+# CLI
+# -----------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["prequal","postqual"], default="prequal")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["prequal","postqual"], default="postqual")
+    args = ap.parse_args()
     build_features(mode=args.mode)
