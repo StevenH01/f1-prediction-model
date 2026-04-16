@@ -49,6 +49,16 @@ def load_kaggle_tables(base_dir: Path | None = None) -> dict[str, pd.DataFrame]:
     races["race_order"] = races.sort_values(["year","round"]).groupby("year").cumcount()
     races["season_order"] = races.sort_values(["year","round"]).reset_index().index
 
+    # Sprint results (optional — only present from 2021 onward)
+    sprint_path = base_dir / "sprint_results.csv"
+    if sprint_path.exists():
+        sprint_results = pd.read_csv(sprint_path)
+        for c in ["raceId", "driverId", "constructorId"] :
+            if c in sprint_results.columns:
+                sprint_results[c] = pd.to_numeric(sprint_results[c], errors="coerce").astype("Int64")
+    else:
+        sprint_results = pd.DataFrame(columns=["raceId", "driverId", "constructorId", "positionOrder"])
+
     return {
         "races": races,
         "results": results,
@@ -57,4 +67,5 @@ def load_kaggle_tables(base_dir: Path | None = None) -> dict[str, pd.DataFrame]:
         "qualifying": qualifying,
         "circuits": circuits,
         "status": status,
+        "sprint_results": sprint_results,
     }
